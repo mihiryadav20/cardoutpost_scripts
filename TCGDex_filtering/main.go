@@ -386,5 +386,9 @@ func main() {
 		len(filtered), float64(len(filtered))/float64(len(allCards))*100)
 	printStats(filtered)
 
+	// Overwrite cache with filtered cards only
+	saveCache(filtered)
+	fmt.Printf("\n  Cache updated: %d cards saved to %s\n", len(filtered), cachePath())
+
 	fmt.Println("Done.")
 }
