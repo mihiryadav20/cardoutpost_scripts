@@ -100,6 +100,7 @@ type ScoredCard struct {
 	NMAvg7d     float64 `json:"nm_avg7d"`
 	NMAvg30d    float64 `json:"nm_avg30d"`
 
+	RarityTier string  `json:"rarity_tier"`
 	PriceTrend float64 `json:"price_trend"`
 	PackScore  float64 `json:"pack_score"`
 	HasGraded  bool    `json:"has_graded"`
@@ -117,7 +118,6 @@ type ScoredCard struct {
 	PrevScanDate  *string  `json:"prev_scan_date"`
 	SalesPerWeek  *float64 `json:"sales_per_week"`
 
-	DedupReason *string `json:"dedup_reason,omitempty"`
 }
 
 type OutputFile struct {
@@ -188,6 +188,21 @@ func main() {
 	prevScan := loadPreviousScan()
 	if len(prevScan) > 0 {
 		fmt.Printf("Previous scan loaded: %d cards (for velocity tracking)\n", len(prevScan))
+
+		// On re-runs, only fetch cards that were in the previous clean output
+		// This cuts API calls from ~7,900 to ~1,800
+		prevIDs := make(map[string]bool)
+		for id := range prevScan {
+			prevIDs[id] = true
+		}
+		var refreshFiltered []TCGDexCard
+		for _, c := range filtered {
+			if prevIDs[c.ID] {
+				refreshFiltered = append(refreshFiltered, c)
+			}
+		}
+		fmt.Printf("Refresh mode: %d → %d cards (only previously matched)\n", len(filtered), len(refreshFiltered))
+		filtered = refreshFiltered
 	} else {
 		fmt.Println("No previous scan found — velocity data will be available after the next run.")
 	}
@@ -470,8 +485,10 @@ func deduplicateResults(results []ScoredCard) []ScoredCard {
 		}
 	}
 
+	// Mark duplicates
+	removals := make(map[int]bool)
 	dupCount := 0
-	for ptID, indices := range groups {
+	for _, indices := range groups {
 		if len(indices) <= 1 {
 			continue
 		}
@@ -487,25 +504,33 @@ func deduplicateResults(results []ScoredCard) []ScoredCard {
 			}
 		}
 
-		// Demote all others
+		// Mark all others for removal
 		for _, idx := range indices {
-			if idx == bestIdx {
-				continue
+			if idx != bestIdx {
+				removals[idx] = true
+				dupCount++
 			}
-			results[idx].Matched = false
-			reason := fmt.Sprintf("duplicate of %s (kept %s)", ptID, results[bestIdx].TcgdexID)
-			results[idx].DedupReason = &reason
-			results[idx].LiquidityScore = 0
-			results[idx].PackScore = 0
-			dupCount++
 		}
 	}
 
-	if dupCount > 0 {
-		fmt.Printf("  Dedup: removed %d duplicate matches (kept best price match per PokeTrace card)\n", dupCount)
+	// Build clean list: only matched, non-duplicate, $1+ NM avg cards
+	var clean []ScoredCard
+	lowPrice := 0
+	for i, r := range results {
+		if removals[i] || !r.Matched {
+			continue
+		}
+		if r.PoketraceAvgNM < 1.0 {
+			lowPrice++
+			continue
+		}
+		clean = append(clean, r)
 	}
 
-	return results
+	fmt.Printf("  Cleanup: removed %d duplicates, %d unmatched, %d under $1 → %d cards\n",
+		dupCount, len(results)-len(clean)-dupCount-lowPrice, lowPrice, len(clean))
+
+	return clean
 }
 
 // ── Score normalization (two-pass) ──
@@ -827,6 +852,7 @@ func scoreCard(tcg TCGDexCard, pt PTCard, prev prevScanMap) ScoredCard {
 		NMAvg7d:     nmAvg7d,
 		NMAvg30d:    nmAvg30d,
 
+		RarityTier: mapRarityTier(pt.Rarity),
 		PriceTrend: priceTrend,
 		PackScore:  packScore,
 		HasGraded:  hasGraded,
@@ -871,20 +897,20 @@ func applyVelocity(sc *ScoredCard, prev prevScanMap) {
 	sc.PrevSaleCount = &prevCount
 	sc.PrevScanDate = &entry.ScanDate
 
-	if sc.TotalSaleCount < prevCount {
-		return
-	}
-
 	prevTime, err := time.Parse(time.RFC3339, entry.ScanDate)
 	if err != nil {
 		return
 	}
 	daysBetween := time.Since(prevTime).Hours() / 24
-	if daysBetween < 1 {
+	if daysBetween < 0.5 {
 		return
 	}
 
-	velocity := float64(sc.TotalSaleCount-prevCount) / daysBetween * 7
+	delta := sc.TotalSaleCount - prevCount
+	if delta < 0 {
+		delta = 0
+	}
+	velocity := float64(delta) / daysBetween * 7
 	velocity = math.Round(velocity*10) / 10
 	sc.SalesPerWeek = &velocity
 }
@@ -971,6 +997,23 @@ func getGradedStats(pt PTCard, grade string) gradedStats {
 		}
 	}
 	return combined
+}
+
+func mapRarityTier(rarity string) string {
+	switch rarity {
+	case "Common":
+		return "Common"
+	case "Uncommon":
+		return "Uncommon"
+	case "Rare", "Holo Rare", "Rare BREAK", "Promo", "Rare Ace", "Amazing Rare", "Radiant Rare", "Classic Collection", "":
+		return "Rare"
+	case "Ultra Rare", "Double Rare", "ACE SPEC Rare":
+		return "Ultra Rare"
+	case "Illustration Rare", "Special Illustration Rare", "Hyper Rare", "Secret Rare", "Shiny Holo Rare", "Shiny Rare":
+		return "Chase"
+	default:
+		return "Rare"
+	}
 }
 
 func detectGradedTiers(pt PTCard) bool {
@@ -1073,11 +1116,10 @@ func saveCSV(results []ScoredCard) {
 		"price_stability", "freshness_days", "liquidity_score", "matched",
 		"set_slug", "card_number", "variant", "rarity", "image_url",
 		"lp_avg_price", "nm_sale_count", "nm_avg7d", "nm_avg30d",
-		"price_trend", "pack_score", "has_graded",
+		"rarity_tier", "price_trend", "pack_score", "has_graded",
 		"psa_10_avg", "psa_10_sale_count", "psa_10_avg7d", "psa_10_avg30d",
 		"psa_9_avg", "psa_9_sale_count", "psa_9_avg7d", "psa_9_avg30d",
 		"prev_sale_count", "prev_scan_date", "sales_per_week",
-		"dedup_reason",
 	}
 	w.Write(header)
 
@@ -1098,11 +1140,6 @@ func saveCSV(results []ScoredCard) {
 		if c.SalesPerWeek != nil {
 			velocity = fmt.Sprintf("%.1f", *c.SalesPerWeek)
 		}
-		dedup := ""
-		if c.DedupReason != nil {
-			dedup = *c.DedupReason
-		}
-
 		row := []string{
 			c.TcgdexID, c.PoketraceID, c.Name, c.Set,
 			fmt.Sprintf("%.2f", c.TcgdexPrice), fmt.Sprintf("%.2f", c.PoketraceAvgNM),
@@ -1110,11 +1147,10 @@ func saveCSV(results []ScoredCard) {
 			fmt.Sprintf("%.1f", c.PriceStability), strconv.Itoa(c.FreshnessDays), fmt.Sprintf("%.1f", c.LiquidityScore), strconv.FormatBool(c.Matched),
 			c.SetSlug, c.CardNumber, variant, c.Rarity, c.ImageURL,
 			fmt.Sprintf("%.2f", c.LPAvgPrice), strconv.Itoa(c.NMSaleCount), fmt.Sprintf("%.3f", c.NMAvg7d), fmt.Sprintf("%.3f", c.NMAvg30d),
-			fmt.Sprintf("%.2f", c.PriceTrend), fmt.Sprintf("%.1f", c.PackScore), strconv.FormatBool(c.HasGraded),
+			c.RarityTier, fmt.Sprintf("%.2f", c.PriceTrend), fmt.Sprintf("%.1f", c.PackScore), strconv.FormatBool(c.HasGraded),
 			fmt.Sprintf("%.2f", c.PSA10Avg), strconv.Itoa(c.PSA10SaleCount), fmt.Sprintf("%.3f", c.PSA10Avg7d), fmt.Sprintf("%.3f", c.PSA10Avg30d),
 			fmt.Sprintf("%.2f", c.PSA9Avg), strconv.Itoa(c.PSA9SaleCount), fmt.Sprintf("%.3f", c.PSA9Avg7d), fmt.Sprintf("%.3f", c.PSA9Avg30d),
 			prevSales, prevDate, velocity,
-			dedup,
 		}
 		w.Write(row)
 	}
