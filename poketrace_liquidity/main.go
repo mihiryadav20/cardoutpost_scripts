@@ -51,6 +51,12 @@ type PTCard struct {
 	Currency   string            `json:"currency"`
 	Prices     map[string]PTTier `json:"prices"`
 	Updated    string            `json:"lastUpdated"`
+	Refs       PTRefs            `json:"refs"`
+}
+
+type PTRefs struct {
+	TcgplayerID *string `json:"tcgplayerId"`
+	CardmarketID *string `json:"cardmarketId"`
 }
 
 type PTSet struct {
@@ -76,6 +82,7 @@ type PTConditionStats struct {
 type ScoredCard struct {
 	TcgdexID           string  `json:"tcgdex_id"`
 	PoketraceID        string  `json:"poketrace_id"`
+	TcgplayerID        string  `json:"tcgplayer_id"`
 	Name               string  `json:"name"`
 	Set                string  `json:"set"`
 	TcgdexPrice        float64 `json:"tcgdex_price"`
@@ -287,7 +294,7 @@ func main() {
 					return
 				}
 
-				scored, err := enrichCard(job.card, prevScan)
+				scored, err := enrichCard(job.card, prevScan, rateLimiter)
 				if err != nil {
 					fmt.Printf("  [%d/%d] ERROR %s: %v\n", job.index+1, len(filtered), job.card.Name, err)
 					scored = unmatchedCard(job.card, prevScan)
@@ -588,7 +595,7 @@ func normalizeScores(results []ScoredCard) {
 
 // ── PokeTrace API ──
 
-func enrichCard(card TCGDexCard, prev prevScanMap) (ScoredCard, error) {
+func enrichCard(card TCGDexCard, prev prevScanMap, rateLimiter *time.Ticker) (ScoredCard, error) {
 	ptCards, err := searchPokeTrace(card.Name)
 	if err != nil {
 		return ScoredCard{}, err
@@ -601,6 +608,15 @@ func enrichCard(card TCGDexCard, prev prevScanMap) (ScoredCard, error) {
 	best := findBestMatch(card, ptCards)
 	if best == nil {
 		return unmatchedCard(card, prev), nil
+	}
+
+	// Fetch full card detail to get refs (tcgplayerId)
+	if best.Refs.TcgplayerID == nil || *best.Refs.TcgplayerID == "" {
+		<-rateLimiter.C // wait for rate limit token before second API call
+		detail, err := fetchCardDetail(best.ID)
+		if err == nil && detail != nil {
+			best.Refs = detail.Refs
+		}
 	}
 
 	return scoreCard(card, *best, prev), nil
@@ -657,6 +673,59 @@ func searchPokeTrace(cardName string) ([]PTCard, error) {
 	}
 
 	return nil, fmt.Errorf("all retries exhausted: %w", lastErr)
+}
+
+func fetchCardDetail(poketraceID string) (*PTCard, error) {
+	endpoint := fmt.Sprintf("%s/cards/%s", baseURL, url.PathEscape(poketraceID))
+
+	var lastErr error
+	backoffs := []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second}
+
+	for attempt := 0; attempt <= 3; attempt++ {
+		if attempt > 0 {
+			fmt.Printf("    Detail retry %d/3 after %s...\n", attempt, backoffs[attempt-1])
+			time.Sleep(backoffs[attempt-1])
+		}
+
+		req, _ := http.NewRequest("GET", endpoint, nil)
+		req.Header.Set("X-API-Key", apiKey)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("HTTP error: %w", err)
+			continue
+		}
+
+		if rl := resp.Header.Get("X-RateLimit-Remaining"); rl != "" {
+			if val, err := strconv.Atoi(rl); err == nil {
+				atomic.StoreInt64(&rateLimitRemain, int64(val))
+			}
+		}
+
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			resp.Body.Close()
+			continue
+		}
+
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+
+		var wrapper struct {
+			Data PTCard `json:"data"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&wrapper)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("JSON decode: %w", err)
+		}
+
+		return &wrapper.Data, nil
+	}
+
+	return nil, fmt.Errorf("detail fetch retries exhausted: %w", lastErr)
 }
 
 // ── Matching ──
@@ -825,9 +894,15 @@ func scoreCard(tcg TCGDexCard, pt PTCard, prev prevScanMap) ScoredCard {
 
 	stability = math.Round(stability*10) / 10
 
+	tcgplayerID := ""
+	if pt.Refs.TcgplayerID != nil {
+		tcgplayerID = *pt.Refs.TcgplayerID
+	}
+
 	sc := ScoredCard{
 		TcgdexID:           tcg.ID,
 		PoketraceID:        pt.ID,
+		TcgplayerID:        tcgplayerID,
 		Name:               tcg.Name,
 		Set:                pt.Set.Name,
 		TcgdexPrice:        tcg.Price,
@@ -1111,7 +1186,7 @@ func saveCSV(results []ScoredCard) {
 	defer w.Flush()
 
 	header := []string{
-		"tcgdex_id", "poketrace_id", "name", "set", "tcgdex_price", "poketrace_avg_nm",
+		"tcgdex_id", "poketrace_id", "tcgplayer_id", "name", "set", "tcgdex_price", "poketrace_avg_nm",
 		"total_sale_count", "ebay_sale_count", "tcgplayer_sale_count", "platform_count",
 		"price_stability", "freshness_days", "liquidity_score", "matched",
 		"set_slug", "card_number", "variant", "rarity", "image_url",
@@ -1141,7 +1216,7 @@ func saveCSV(results []ScoredCard) {
 			velocity = fmt.Sprintf("%.1f", *c.SalesPerWeek)
 		}
 		row := []string{
-			c.TcgdexID, c.PoketraceID, c.Name, c.Set,
+			c.TcgdexID, c.PoketraceID, c.TcgplayerID, c.Name, c.Set,
 			fmt.Sprintf("%.2f", c.TcgdexPrice), fmt.Sprintf("%.2f", c.PoketraceAvgNM),
 			strconv.Itoa(c.TotalSaleCount), strconv.Itoa(c.EbaySaleCount), strconv.Itoa(c.TcgplayerSaleCount), strconv.Itoa(c.PlatformCount),
 			fmt.Sprintf("%.1f", c.PriceStability), strconv.Itoa(c.FreshnessDays), fmt.Sprintf("%.1f", c.LiquidityScore), strconv.FormatBool(c.Matched),
