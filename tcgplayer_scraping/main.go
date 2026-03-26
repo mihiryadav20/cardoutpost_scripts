@@ -1,12 +1,15 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -143,8 +146,10 @@ type ProgressFile struct {
 const (
 	inputPath       = "../poketrace_liquidity/.cache/tcgplayer_ids.json"
 	progressPath    = ".cache/tcgplayer_progress.json"
-	detailsOutputPath      = ".cache/tcgplayer_details.json"
-	priceHistoryOutputPath = ".cache/tcgplayer_price_history.json"
+	detailsOutputPath         = ".cache/tcgplayer_details.json"
+	detailsCSVPath            = ".cache/tcgplayer_details.csv"
+	priceHistoryOutputPath    = ".cache/tcgplayer_price_history.json"
+	priceHistoryCSVPath       = ".cache/tcgplayer_price_history.csv"
 	detailsURL      = "https://mp-search-api.tcgplayer.com/v2/product/%s/details?mpfev=4952"
 	priceHistoryURL = "https://infinite-api.tcgplayer.com/price/history/%s/detailed?range=quarter"
 	numWorkers      = 3
@@ -463,6 +468,131 @@ func saveOutput(results []ScrapedCard) {
 	data, _ = json.MarshalIndent(historyOut, "", "  ")
 	os.WriteFile(priceHistoryOutputPath, data, 0644)
 	fmt.Printf("  Price history saved to %s (%d cards)\n", priceHistoryOutputPath, len(history))
+
+	// 3. Details CSV
+	saveDetailsCSV(details)
+
+	// 4. Price history CSV
+	savePriceHistoryCSV(history)
+}
+
+func saveDetailsCSV(details []DetailsEntry) {
+	f, err := os.Create(detailsCSVPath)
+	if err != nil {
+		fmt.Printf("  ERROR creating details CSV: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	header := []string{
+		"tcgplayer_id", "name", "scraped_at",
+		"product_id", "product_name", "product_url_name",
+		"product_type_id", "product_type_name",
+		"product_line_id", "product_line_name", "product_line_url_name",
+		"product_status_id",
+		"set_id", "set_name", "set_code", "set_url_name",
+		"rarity_name",
+		"market_price", "lowest_price", "lowest_price_with_shipping", "median_price",
+		"listings", "custom_listings", "sellers", "max_fulfillable_quantity", "score",
+		"sealed", "foil_only", "normal_only", "seller_listable", "duplicate",
+		"image_count", "shipping_category_id",
+		"custom_attributes", "formatted_attributes",
+		"skus",
+	}
+	w.Write(header)
+
+	for _, e := range details {
+		d := e.ProductDetails
+		medianStr := ""
+		if d.MedianPrice != nil {
+			medianStr = fmtFloat(*d.MedianPrice)
+		}
+
+		customAttr, _ := json.Marshal(d.CustomAttributes)
+		fmtAttr, _ := json.Marshal(d.FormattedAttributes)
+
+		var skuParts []string
+		for _, s := range d.Skus {
+			skuParts = append(skuParts, fmt.Sprintf("%d|%s|%s|%s", s.Sku, s.Condition, s.Variant, s.Language))
+		}
+
+		row := []string{
+			e.TcgplayerID, e.Name, e.ScrapedAt,
+			fmtFloat(d.ProductID), d.ProductName, d.ProductUrlName,
+			fmtFloat(d.ProductTypeID), d.ProductTypeName,
+			fmtFloat(d.ProductLineID), d.ProductLineName, d.ProductLineUrlName,
+			fmtFloat(d.ProductStatusID),
+			fmtFloat(d.SetID), d.SetName, d.SetCode, d.SetUrlName,
+			d.RarityName,
+			fmtFloat(d.MarketPrice), fmtFloat(d.LowestPrice), fmtFloat(d.LowestPriceWithShipping), medianStr,
+			fmtFloat(d.Listings), fmtFloat(d.CustomListings), fmtFloat(d.Sellers), fmtFloat(d.MaxFulfillableQuantity), fmtFloat(d.Score),
+			strconv.FormatBool(d.Sealed), strconv.FormatBool(d.FoilOnly), strconv.FormatBool(d.NormalOnly), strconv.FormatBool(d.SellerListable), strconv.FormatBool(d.Duplicate),
+			fmtFloat(d.ImageCount), fmtFloat(d.ShippingCategoryID),
+			string(customAttr), string(fmtAttr),
+			strings.Join(skuParts, ";"),
+		}
+		w.Write(row)
+	}
+
+	fmt.Printf("  Details CSV saved to %s (%d rows)\n", detailsCSVPath, len(details))
+}
+
+func savePriceHistoryCSV(history []PriceHistoryEntry) {
+	f, err := os.Create(priceHistoryCSVPath)
+	if err != nil {
+		fmt.Printf("  ERROR creating price history CSV: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	header := []string{
+		"tcgplayer_id", "name", "scraped_at",
+		"sku_id", "variant", "language", "condition",
+		"avg_daily_quantity_sold", "avg_daily_transaction_count",
+		"total_quantity_sold", "total_transaction_count",
+		"trending_market_price_percentages",
+		"bucket_start_date", "market_price", "quantity_sold", "transaction_count",
+		"low_sale_price", "low_sale_price_with_shipping",
+		"high_sale_price", "high_sale_price_with_shipping",
+	}
+	w.Write(header)
+
+	rows := 0
+	for _, e := range history {
+		for _, item := range e.PriceHistory.Result {
+			trendJSON, _ := json.Marshal(item.TrendingMarketPricePercentages)
+
+			for _, bucket := range item.Buckets {
+				row := []string{
+					e.TcgplayerID, e.Name, e.ScrapedAt,
+					item.SkuID, item.Variant, item.Language, item.Condition,
+					item.AverageDailyQuantitySold, item.AverageDailyTransactionCount,
+					item.TotalQuantitySold, item.TotalTransactionCount,
+					string(trendJSON),
+					bucket.BucketStartDate, bucket.MarketPrice, bucket.QuantitySold, bucket.TransactionCount,
+					bucket.LowSalePrice, bucket.LowSalePriceWithShipping,
+					bucket.HighSalePrice, bucket.HighSalePriceWithShipping,
+				}
+				w.Write(row)
+				rows++
+			}
+		}
+	}
+
+	fmt.Printf("  Price history CSV saved to %s (%d rows)\n", priceHistoryCSVPath, rows)
+}
+
+func fmtFloat(v float64) string {
+	if v == float64(int64(v)) {
+		return strconv.FormatInt(int64(v), 10)
+	}
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 func printSummary(results []ScrapedCard) {
